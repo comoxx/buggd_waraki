@@ -211,7 +211,7 @@ def record_sensor(sensor, working_dir, data_dir, led_driver):
     # Check whether the daily reboot is required
     cmd_on_complete = None
     if check_reboot_due(REBOOT_TIME_UTC):
-        cmd_on_complete = 'sudo reboot'
+        cmd_on_complete = ['sudo systemctl stop buggd.service', 'sudo reboot']
 
     # Postprocess the raw data in a separate thread
     postprocess_t = threading.Thread(target=sensor.postprocess, args=(uncomp_f,cmd_on_complete,))
