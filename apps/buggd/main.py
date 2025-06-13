@@ -325,6 +325,8 @@ def waraki_server_sync(sync_interval, upload_dir, die, config_path, led_driver, 
 
         else:
             logger.info('No internet connection available, so not trying Waraki sync')
+            # if no internet, prepare modem for restart
+            modem.power_off()
 
         # Disable the modem to save power
         #logger.info('Disabling modem until next server sync (to save power)')
@@ -478,6 +480,9 @@ def record_http(led_driver, modem):
     if not GLOB_offline_mode:
         # Enable the modem for a mobile network connection. If no modem set recorder to offline mode
         GLOB_offline_mode = not modem.power_on()
+    
+    #just hardcoding the mode for now; we don't need to concern ourselves with the offline mode feature.
+    GLOB_offline_mode = False
 
     # Try to mount the external SD card
     try:
