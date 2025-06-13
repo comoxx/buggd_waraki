@@ -157,6 +157,7 @@ class I2SMic(SensorBase):
             os.remove(uncomp_path)
 
         if cmd_on_complete:
+            call_cmd_line('sudo systemctl stop buggd.service') # Stop the buggd service to avoid conflicts
             call_cmd_line(cmd_on_complete)
 
 
