@@ -79,6 +79,7 @@ logger = log.logger
 logger.setLevel(logging.INFO)
 
 # constants for the recording modes
+MODE_DEFAULT_WARAKI = 0
 MODE_HTTP = 1
 MODE_WEBSOCKET_SAFE = 2
 MODE_CONTINUOUS_STREAM = 3
@@ -211,7 +212,7 @@ def record_sensor(sensor, working_dir, data_dir, led_driver):
     # Check whether the daily reboot is required
     cmd_on_complete = None
     if check_reboot_due(REBOOT_TIME_UTC):
-        cmd_on_complete = ['sudo systemctl stop buggd.service', 'sudo reboot']
+        cmd_on_complete = 'sudo reboot'
 
     # Postprocess the raw data in a separate thread
     postprocess_t = threading.Thread(target=sensor.postprocess, args=(uncomp_f,cmd_on_complete,))
@@ -243,6 +244,102 @@ class StopMonitoring(Exception):
     """
 
     pass
+
+
+def default_waraki_server_sync(sync_interval, upload_dir, die, config_path, led_driver, modem, data_led_update_int, server_url):
+
+    """
+    Function to synchronize the upload data folder with the GCS bucket
+
+    Parameters:
+        sync_interval: The time interval between synchronisation connections
+        upload_dir: The upload directory to synchronise (top level, not the device specific subdirectory)
+        die: A threading event to terminate the GCS server sync
+        led_driver: The I2C driver for controlling the LEDs
+        data_led_update_int: How often to update the status of the data LED in minutes
+    """
+
+    global GLOB_is_connected
+    global log
+
+    # Sleep the thread and keep updating the data LED until the first upload cycle
+    start_t = time.time()
+    start_offs = sync_interval/2
+    logger.info('Sleeping data upload thread for {} secs before first upload'.format(start_offs))
+
+    # Check for internet conn to update LED
+    GLOB_is_connected = check_internet_conn(led_driver, DATA_LED_CHS, col_succ=DATA_LED_CONN, col_fail=DATA_LED_NO_CONN)
+    # Turn off modem to save power
+    modem.power_off()
+
+    # Wait till half way through first recording to first upload try
+    wait_t = start_offs - (time.time() - start_t)
+    time.sleep(max(0, wait_t))
+
+    # keep running while the die is not set
+    while not die.is_set():
+        # Update sync start time
+        start_t = time.time()
+
+        # Enable the modem and wait for an internet connection
+        modem.power_on()
+        GLOB_is_connected = wait_for_internet_conn(BOOT_INTERNET_RETRIES, 
+                                                   led_driver, 
+                                                   DATA_LED_CHS, 
+                                                   col_succ=DATA_LED_CONN, 
+                                                   col_fail=DATA_LED_NO_CONN)
+
+        # Set data LED to active uploading state (only if the device is connected as otherwise it's confusing - is the device uploading or not?)
+        if GLOB_is_connected:
+            # Update time from internet
+            update_time()
+
+            logger.info('Started Default Waraki sync at {} to upload_dir {}'.format(dt.datetime.utcnow(), upload_dir))
+
+            # Set the LED to uploading colour
+            set_led(led_driver, DATA_LED_CHS, DATA_LED_UPLOADING)
+
+            log.rotate_log()
+
+            try:
+                # Get credentials from JSON file
+                upload_url = f"{server_url}/api/bugg/upload"
+                for root, subdirs, files in os.walk(upload_dir):
+                    for local_f in files:
+                        local_path = os.path.join(root, local_f)
+                        if local_f.endswith('.log'):
+                            continue    
+                        logger.info(f'Uploading {local_path} to Waraki...')
+                        try:
+                            with open(local_path, 'rb') as f:
+                                file_payload = {'file' : (local_f, f)}
+                                data_payload = {'password' : 'soundscape'}
+                                response = requests.post(upload_url, files = file_payload, data = data_payload)
+                            response.raise_for_status()                                
+                            logger.info(f'Upload of {local_f} to Waraki completed.')
+                            os.remove(local_path)
+                        except Exception as e:
+                            logger.error(f'Failed to upload {local_f} to Waraki. {e}')
+
+            except Exception as e:
+                logger.info('Exception caught in gcs_server_sync: {}'.format(str(e)))
+                debug.write_traceback_to_log()
+
+            # Done uploading so set LED back to connected mode
+            set_led(led_driver, DATA_LED_CHS, DATA_LED_CONN)
+
+        else:
+            logger.info('No internet connection available, so not trying GCS sync')
+
+        # Disable the modem to save power
+        logger.info('Disabling modem until next server sync (to save power)')
+        modem.power_off()
+
+        # Sleep the thread until the next upload cycle
+        sync_wait = sync_interval - (time.time() - start_t)
+        logger.info('Waiting {} secs to next sync'.format(sync_wait))
+        time.sleep(max(0, sync_wait))
+
 
 
 def waraki_server_sync(sync_interval, upload_dir, die, config_path, led_driver, modem, data_led_update_int, server_url):
@@ -459,6 +556,127 @@ def blink_error_leds(led_driver, error_e, dur=None):
     if REBOOT_ALLOWED:
         logger.info('Rebooting device to try recover from error')
         call_cmd_line('sudo reboot')
+
+
+
+
+def record_default_waraki(led_driver, modem):
+    """
+    Function to setup, run and log continuous sampling from the sensor.
+
+    Notable variables:
+        logfile_name: The filename that the logs from this run should be stored to
+        log_dir: A directory to be used for logging. Existing log files
+        found in will be moved to upload.
+    """
+
+    global GLOB_no_sd_mode
+    global GLOB_is_connected
+    global GLOB_offline_mode
+    global log
+
+    if not GLOB_offline_mode:
+        # Enable the modem for a mobile network connection. If no modem set recorder to offline mode
+        GLOB_offline_mode = not modem.power_on()
+
+    # Try to mount the external SD card
+    try:
+        mount_ext_sd(SD_MNT_LOC)
+        check_sd_not_corrupt(SD_MNT_LOC)
+    except Exception as e:
+        GLOB_no_sd_mode = True
+        logger.info('Couldn\'t mount external SD card: {}'.format(str(e)))
+
+    # Try to load the config files from the SD card
+    try:
+        copy_sd_card_config(SD_MNT_LOC, CONFIG_FNAME)
+    except Exception as e:
+        # Check if there's a local config file we can fall back to
+        if os.path.exists(CONFIG_FNAME):
+            logger.info('Couldn\'t copy SD card config, but a config file already exists so continuing ({})'.format(str(e)))
+        else:
+            logger.info('Couldn\'t copy SD card config, and no config already exists... ({})'.format(str(e)))
+
+            if GLOB_no_sd_mode:
+                # If there's no SD card too then there's no point in continuing
+                logger.info('GLOB_no_sd_mode also activated - can\'t fallback as offline recorder so bailing')
+                raise e
+            else:
+                # If there is an SD card we can just run as an offline recorder saving to the SD
+                GLOB_offline_mode = True
+
+    if GLOB_offline_mode:
+        # Set LEDs to offline mode
+        set_led(led_driver, DATA_LED_CHS, DATA_LED_NO_CONN_OFFL)
+        logger.info('Recorder is in offline mode saving to SD card')
+    else:
+        # Waiting for internet connection
+        GLOB_is_connected = wait_for_internet_conn(BOOT_INTERNET_RETRIES, led_driver, DATA_LED_CHS, col_succ=DATA_LED_CONN, col_fail=DATA_LED_NO_CONN)
+
+        if GLOB_is_connected:
+            # Update time from internet
+            update_time()
+
+    # Determine the system configuration options automatically
+    working_dir, upload_dir, data_dir = auto_sys_config(SD_MNT_LOC, not GLOB_no_sd_mode)
+
+    # Clean data directories
+    clean_dirs(working_dir,upload_dir,data_dir)
+
+    # Move archived logs to the upload directory
+    log.move_archived_to_dir(upload_dir)
+
+    # Get the server URL from the config file
+    with open(CONFIG_FNAME) as cfgf:
+        server_url = json.load(cfgf)["device"]["server_url"]
+
+    # Now get the sensor
+    sensor = auto_configure_sensor()
+
+    # Set up the threads to run and an event handler to allow them to be shutdown cleanly
+    die = threading.Event()
+    signal.signal(signal.SIGINT, exit_handler)
+
+    if not GLOB_offline_mode:
+        sync_thread = threading.Thread(target=default_waraki_server_sync, args=(sensor.server_sync_interval,
+                                                                     upload_dir, die, CONFIG_FNAME,
+                                                                     led_driver, modem, DATA_LED_UPDATE_INT, 
+                                                                     server_url))
+
+    record_thread = threading.Thread(target=continuous_recording, args=(sensor, working_dir,
+                                                                    data_dir, led_driver, die))
+
+    # Initialise background thread to do remote sync of the root upload directory
+    # Failure here does not preclude data capture and might be temporary so log
+    # errors but don't exit.
+    try:
+        # start the recorder
+        logger.info('Starting continuous recording at {}'.format(dt.datetime.utcnow()))
+        record_thread.start()
+
+        if GLOB_offline_mode:
+            logger.info('Running in offline mode - no GCS synchronisation')
+        else:
+            # start the GCS sync thread
+            sync_thread.start()
+            logger.info('Starting Waraki server sync every {} seconds at {}'.format(sensor.server_sync_interval, dt.datetime.utcnow()))
+
+        # now run a loop that will continue with a small grain until
+        # an interrupt arrives, this is necessary to keep the program live
+        # and listening for interrupts
+        while True:
+            time.sleep(1)
+    except StopMonitoring:
+        # We've had an interrupt signal, so tell the threads to shutdown,
+        # wait for them to finish and then exit the program
+        die.set()
+        record_thread.join()
+        if not GLOB_offline_mode:
+            sync_thread.join()
+
+        logger.info('Recording and sync shutdown, exiting at {}'.format(dt.datetime.utcnow()))
+
+    
 
 
 def record_http(led_driver, modem):
@@ -829,13 +1047,15 @@ def main():
     # mode = config.get("mode")  # e.g., from a JSON file or environment variable
     with open(CONFIG_FNAME) as f:
         config = json.load(f)
-    mode = config['device'].get('mode', MODE_HTTP)  # Load device mode from config
+    mode = config['device'].get('mode', MODE_DEFAULT_WARAKI)  # Load device mode from config
     logger.info(f"Mode selected: {mode}")
     led = UserLED()
     try:
         # run continuous recording function
         led.on()
-        if mode == MODE_HTTP:
+        if mode == MODE_DEFAULT_WARAKI:
+            record_default_waraki(led_driver, modem)
+        elif mode == MODE_HTTP:
             record_http(led_driver, modem)
         elif mode == MODE_WEBSOCKET_SAFE:
             record_websocket_safe(led_driver, modem)
