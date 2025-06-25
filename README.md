@@ -1,66 +1,60 @@
-![cc-by-nc-sa-shield](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)
+# Buggd Audio Recording System
 
-# Introduction
+The Buggd system is an environmental audio monitoring device that can operate in multiple recording modes. It supports both online (cellular) and offline (SD card) recording capabilities.
 
-buggd is the Bugg recording daemon. It is a Python package. The package provides three applications - buggd, modemctl and soundcardctl. 
+## Recording Modes
 
-buggd is the daemon that is responsible for recording audio and uploading it to the user web app. Its behaviour is controlled by JSON configuration files that are provided by the web app. In addition to logging to the system journal, buggd provides status information on the Bugg's front panel LED's. buggd also provides a factory self-test function.
+The recording mode is configured in the `config.json` file under `device.mode`, located in `/mnt/sd` . There are four available modes:
 
-modemctl is a CLI tool for controlling the modem. It is intended for use during development. It allows the user to control the modem power, and get information like signal strength and SIM card status.
+### Mode 0: Default Waraki Mode (MODE_DEFAULT_WARAKI)
+- **Description**: Records audio in fixed-length segments and uploads them periodically (from the original buggd code)
+- **Behavior**: 
+  - Records audio segments (default: 20 minutes)
+  - Compresses audio to MP3 format (configurable)
+  - Uploads files via HTTP POST to the configured server
+  - Powers down modem between uploads to save battery
+  - Supports offline mode - saves to SD card if no connection
+- **Use Case**: Best for battery-powered deployments with periodic connectivity
 
-soundcardctl is a CLI tool for controlling the soundcard. It is intended for use during development. It allows the user to control the soundcard power, set gain and phantom modes, and run a basic recording test.
+### Mode 1: HTTP Mode (MODE_HTTP)
+- **Description**: Similar to Default mode but maintains persistent connection
+- **Behavior**:
+  - Records and uploads audio segments continuously
+  - Keeps modem powered on for faster uploads
+  - No delay before upload attempt
+  - Higher power consumption than Default mode
+- **Use Case**: Suitable for powered installations requiring frequent uploads
 
-# Running
-buggd is launched by a systemd service on boot.
+### Mode 2: WebSocket Safe Mode (MODE_WEBSOCKET_SAFE)
+- **Description**: Records complete audio files then uploads via WebSocket
+- **Behavior**:
+  - Records audio segments to disk
+  - Queues completed files for upload
+  - Maintains persistent WebSocket connection
+  - Deletes files after successful upload
+- **Use Case**: Good for reliable streaming with file backup
 
-# Configuring the device
+### Mode 3: Continuous Stream Mode (MODE_CONTINUOUS_STREAM)
+- **Description**: Real-time audio streaming without file storage
+- **Behavior**:
+  - Continuously captures raw audio
+  - Compresses audio chunks on-the-fly
+  - Streams via WebSocket immediately
+  - No local file storage
+  - Requires constant internet connection
+- **Use Case**: Live audio monitoring applications
 
-To configure the device, use the web interface provided on the Bugg manager website to create and download a ``config.json`` file. This file should be placed on a microSD card, and inserted into the Bugg device. On boot, the Bugg device will read ``config.json`` from the microSD card and copy it to the local eMMC storage. An example ``config.json`` file can be found in the ``hardware_drivers`` directory.
+### Notes
 
-The ``sensor`` part of the configuration file describes the recording parameters for the Bugg device.
+#### Popping sound
+Modes 0, 1, and 2 are not truly continuous recordings: at the end of each segment, the microphone stops and restarts, causing a popping sound. This pop is removed during post-processing. As a result, the actual recording length in these modes is N + 1 seconds, where N is the duration specified in the `config.json` file.
 
-The ``mobile_network`` part contains the APN details for the SIM card in the Bugg device. These can normally be found easily by searching the internet for the details specific to your provider (e.g., "Giffgaff pay monthly APN settings").
+Mode 3, however, supports true continuous recording without any interruptions or popping sounds.
 
-The ``device`` part contains relevant details to link the data to the correct project and configuration file on the Bugg backend (soon also being made open-source).
+#### Connection Mode
+Modes 0 and 1 use HTTP requests to send data to the Waraki server.
 
-The remaining elements in ``config.json`` contain the authentication details for a service account created on the Google Cloud Services console (default upload route for the device is to a GCS bucket). On the GCS console you can download the key for a service account in JSON, and this should match the format of the Bugg's ``config.json`` file.
-
-An example ``config.json`` file is provided in the ``docs`` folder.
-
-# Project structure
-
-The folder structure of buggd is as follows:
-```
-buggd
-├── apps
-│   ├── buggd
-│   ├── modemctl
-│   └── soundcardctl
-├── drivers
-└── sensors
-```
-The ``buggd/apps`` folder contains subfolders for each application, which each contain Python modules of application code. ``buggd/drivers`` contains Python modules for each hardware driver, for example the modem, soundcard and LED's. ``buggd/sensors`` contains Python modules for each "sensor" supported by the platform - currently the internal and external microphones, as well as code for parsing the configuration files.
-
-# Recording code
-The sequence of events from the ``record`` function (in ``python_record.py``) is as follows:
-
-1. Set up error logging.
-2. Log the ID of the Pi device running the code and the current git version of the recorder script.
-3. Enable the Sierra Wireless modem: ``enable_modem``
-4. Mount the external SD card: ``mount_ext_sd``. If unsuccessful, save data to the eMMC storage onboard the Raspberry Pi Compute Module.
-5. Copy the configuration file from the SD card: ``copy_sd_card_config``
-6. Wait for a valid internet connection (if not running in offline mode): ``wait_for_internet_conn``
-7. Instantiate a sensor class object with the configured recording parameters: ``auto_configure_sensor``
-8. Create and launch a thread that executes the GCS data uploading: ``gcs_server_sync``
-9. Create and launch a thread that records and compresses data from the microphone: ``continuous_recording``. The ``record_sensor`` function itself executes the sensor methods: a) ``sensor.capture_data()`` to record whatever it is the sensor records; b) ``sensor.postprocess()`` is run in a separate thread to avoid locking up the ``sensor_record`` loop; and then c) ``sensor.sleep()`` to pause until the next sample is due.
-10. The recording and uploading threads repeat periodically until the device is powered down, or a reboot is performed (by default, at 2am UTC each day)
-
-# Factory test
-buggd provides for two levels of factory test - a board-level test and a full test. The tests are triggered by the presence of "magic files" on the SD card. When a test is triggered, normal behaviour of the daemon (recording and upload) is disabled.
-
-The board-level test is run on the bare mainboard before the product is assembled and the microphone and led boards are connected. It turns on the modem and soundcard power rails so an assembly technician can check the voltages on various test points. It flashes the mainboard user LED to indicate the test is active. The board-level test is triggered by inserting an SD card with an empty file called ``factory-test-bare.txt``. 
-
-The full test is run on the fully assembled Bugg unit. It tests the modem, including the antenna connection by checking for cell towers, the SIM card interface, I2C connections to the internal microphone bridge, RTC and LED controller, as well as recording functionality on the internal and external microphones. At present, the recording test simply listens for white noise, though this will be improved in future. The full test is triggered by inserting an SD card with an empty file called ``factory-test-full.txt``.
+Modes 2 and 3 use WebSockets for data transmission.
 
 ## LED colour codes
 
@@ -92,24 +86,121 @@ On a normal boot (factory test not triggered), a simplified test status is displ
 | Magenta | Green | Factory test passed OK |
 | Magenta | Red | Factory test failed or hasn't run |
 
-## Results file
+## Useful Bugg OS Utilities
 
-The results of the factory test are stored to ``/home/bugg/factory_test_results.txt``. This file is symlinked in ``/etc/issues.d`` so it is displayed to the console on login.
+### Viewing Logs
 
-# Packaging
-buggd is packaged using setuptools. The package definition is in ``pyproject.toml``. 
+The buggd service logs can be viewed using `journalctl`:
 
-## Version numbering
-buggd is versioned according to the [SemVer standard](https://semver.org). The version is set in ``pyproject.toml``
+```bash
+# View all logs
+sudo journalctl 
 
-# To-dos
+# View all buggd service logs
+sudo journalctl -u buggd.service
 
-## Implement off times for the recording schedule. 
+# View live logs (follow mode)
+sudo journalctl -u buggd.service -f
+```
 
-The configuration tool already allows users to pick specific hours of the day for recording, but this is not implemented yet in the firmware. Ideally the Pi would turn off or enter a low-power state during off times to conserve power.
+### Service Management
 
-## Offline mode
+The buggd service runs automatically on boot. To manage it:
 
-There is an offline mode in the firmware that means any attempts for connecting to the internet (updating time, uploading data) are skipped rather than just waiting for time outs. This is currently a hard flag, but should be loaded from the configuration file ideally.
+```bash
+# Check service status
+sudo systemctl status buggd.service
 
-[See also here](https://github.com/bugg-resources/bugg-notes/blob/main/Bugg%20TODO%20Long-Term%20Software.md)
+# Stop the service (recommended before reboot)
+sudo systemctl stop buggd.service
+
+# Start the service
+sudo systemctl start buggd.service
+
+# Restart the service
+sudo systemctl restart buggd.service
+
+# Disable automatic startup
+sudo systemctl disable buggd.service
+
+# Enable automatic startup
+sudo systemctl enable buggd.service
+```
+
+### Safe Shutdown Procedure
+
+To safely shut down the device:
+
+```bash
+# First, stop the buggd service
+sudo systemctl stop buggd.service
+
+# Then reboot the system
+sudo reboot
+```
+
+This ensures that any ongoing recordings are properly terminated and files are saved.
+
+### Manual Control Utilities
+
+The buggd package includes command-line utilities for testing and debugging:
+
+```bash
+# Control the modem
+modemctl power on
+modemctl power off
+modemctl get_signal_strength
+modemctl get_sim_state
+
+# Control the soundcard
+soundcardctl power internal on
+soundcardctl power external on
+soundcardctl gain 10
+soundcardctl phantom P48
+soundcardctl variance
+```
+
+### File Locations
+
+- **Buggd code**: `/opt/venv/`
+- **Configuration**: `/mnt/sd/config.json`
+- **Logs**: `/mnt/sd/audio/logs`
+- **Audio data**: `/mnt/sd/audio/`
+- **Factory test results**: `/home/bugg/factory_test_results.txt`
+
+### Configuration File
+
+The device behavior is controlled by `/mnt/sd/config.json`. Key parameters include:
+
+- `device.mode`: Recording mode (0-3)
+- `device.server_url`: Upload server URL
+- `sensor.record_length`: Audio segment duration (seconds)
+- `sensor.compress_data`: Enable MP3 compression
+- `sensor.gain`: Microphone gain (0-20)
+
+### Troubleshooting
+
+1. **No audio recording**:
+   - Check LED status
+   - Verify microphone connections
+   - Review logs: `sudo journalctl -u buggd.service -f`
+
+2. **No uploads**:
+   - Check cellular signal: `modemctl get_signal_strength`
+   - Verify SIM card: `modemctl get_sim_state`
+   - Check internet connectivity in logs
+
+3. **Factory test**:
+   - Create `/mnt/sd/factory-test-full.txt` on SD card
+   - Reboot device
+   - Check results in `/home/bugg/factory_test_results.txt`
+
+### Development
+
+To modify the buggd code:
+
+1. Stop the service: `sudo systemctl stop buggd.service`
+2. Navigate to code: `cd /opt/venv/`
+3. Make changes
+4. Test manually: `sudo /opt/venv/bin/python -m buggd`
+5. Restart service: `sudo systemctl start buggd.service`
